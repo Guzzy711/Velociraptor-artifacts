@@ -1,18 +1,17 @@
 name: Custom.Generic.Collection.ClaudeCodePrompts
 description: |
-  Collects Claude Code agentic coding prompts from user history files.
+  Collects agentic coding prompts from Claude Code and Codex history files.
 
-  Reads ~/.claude/history.jsonl from all detected user home directories.
-  Each line records a prompt submitted to Claude Code along with its timestamp
-  and the project path where it was run.
+  Reads ~/.claude/history.jsonl (Claude Code) and ~/.codex/history.jsonl (Codex)
+  from all detected user home directories. Results are combined into a single table
+  with a Tool column identifying the source.
 
   Useful for auditing AI-assisted coding activity across all users on an
   endpoint, or recovering prompts before they age out (default 30-day cleanup).
 
   ## NOTES
-  - Targets ~/.claude/history.jsonl (the prompt recall history), not full
-    session transcripts at ~/.claude/projects/**/*.jsonl.
-  - Set Upload_File=Y to retain the raw history file as server evidence.
+  - Targets prompt recall history files, not full session transcripts.
+  - Set Upload_File=Y to retain the raw history files as server evidence.
 
 type: CLIENT
 
@@ -27,6 +26,10 @@ parameters:
   - name: HistoryGlob
     description: Glob patterns to locate Claude Code history files.
     default: /home/*/.claude/history.jsonl,/root/.claude/history.jsonl
+
+  - name: CodexHistoryGlob
+    description: Glob patterns to locate Codex history files.
+    default: /home/*/.codex/history.jsonl,/root/.codex/history.jsonl
 
   - name: PromptFilter
     type: regex
@@ -56,29 +59,45 @@ sources:
                                then=DateBefore,
                                else=timestamp(epoch="2200-01-01"))
       
-      LET HistoryFiles <= SELECT OSPath,
-                                 regex_replace(source=str(str=OSPath),
-                                               re="/.claude/history.jsonl$",
-                                               replace="") AS HomeDir
-        FROM glob(globs=split(string=HistoryGlob, sep=","))
-      
-      SELECT HomeDir,
-             OSPath AS HistoryFile,
-             Timestamp,
-             ProjectPath,
-             SessionId,
-             Prompt,
-             if(condition=Upload_File, then=upload(file=OSPath), else=NULL) AS Upload
-      FROM foreach(row=HistoryFiles,
-                   query={
-          SELECT HomeDir,
-                 OSPath,
+      LET ClaudeFiles <= SELECT OSPath,
+        regex_replace(source=str(str=OSPath),
+          re="/.claude/history.jsonl$", replace="") AS HomeDir
+      FROM glob(globs=split(string=HistoryGlob, sep=","))
+
+      LET CodexFiles <= SELECT OSPath,
+        regex_replace(source=str(str=OSPath),
+          re="/.codex/history.jsonl$", replace="") AS HomeDir
+      FROM glob(globs=split(string=CodexHistoryGlob, sep=","))
+
+      SELECT * FROM chain(
+        a={
+          SELECT "Claude Code" AS Tool,
+                 HomeDir,
+                 OSPath AS HistoryFile,
                  timestamp(epoch=timestamp / 1000) AS Timestamp,
                  project AS ProjectPath,
                  sessionId AS SessionId,
-                 display AS Prompt
-          FROM parse_jsonl(filename=OSPath)
-        })
-      WHERE Prompt =~ PromptFilter
-       AND Timestamp > DateAfterTime
+                 display AS Prompt,
+                 if(condition=Upload_File, then=upload(file=OSPath), else=NULL) AS Upload
+          FROM foreach(row=ClaudeFiles,
+                       query={ SELECT HomeDir, OSPath, timestamp, project, sessionId, display FROM parse_jsonl(filename=OSPath) })
+          WHERE Prompt =~ PromptFilter
+            AND Timestamp > DateAfterTime
             AND Timestamp < DateBeforeTime
+        },
+        b={
+          SELECT "Codex" AS Tool,
+                 HomeDir,
+                 OSPath AS HistoryFile,
+                 timestamp(epoch=ts) AS Timestamp,
+                 NULL AS ProjectPath,
+                 session_id AS SessionId,
+                 text AS Prompt,
+                 if(condition=Upload_File, then=upload(file=OSPath), else=NULL) AS Upload
+          FROM foreach(row=CodexFiles,
+                       query={ SELECT HomeDir, OSPath, ts, session_id, text FROM parse_jsonl(filename=OSPath) })
+          WHERE Prompt =~ PromptFilter
+            AND Timestamp > DateAfterTime
+            AND Timestamp < DateBeforeTime
+        }
+      )
